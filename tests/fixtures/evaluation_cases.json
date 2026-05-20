@@ -1,0 +1,101 @@
+{
+  "scoring_cases": [
+    {
+      "name": "frontend_good_match",
+      "profile": {
+        "candidate_name": "Galla Chaitanya",
+        "professional_summary": "Frontend developer with React, TypeScript, Tailwind CSS, and REST API experience.",
+        "role_titles": ["Frontend Developer", "React Developer"],
+        "core_skills": ["React", "TypeScript", "Tailwind CSS", "HTML", "CSS"],
+        "additional_skills": ["REST API", "Next.js"],
+        "years_experience": 2.0,
+        "preferred_locations": ["Hyderabad"],
+        "work_preferences": ["Remote"],
+        "notable_projects": ["Interactive Dashboard Platform"],
+        "resume_source": "fixture"
+      },
+      "job_title": "Frontend Developer",
+      "job_description": "Required: React, TypeScript, Tailwind CSS, HTML, CSS. Preferred: Next.js and REST API experience. Looking for a frontend developer to build responsive interfaces.",
+      "min_score": 70,
+      "expected_blocker_risk": "Low",
+      "required_matched_skills": ["react", "typescript", "tailwind"],
+      "expect_has_blockers": false
+    },
+    {
+      "name": "frontend_bad_match",
+      "profile": {
+        "candidate_name": "Galla Chaitanya",
+        "professional_summary": "Frontend developer with React, TypeScript, Tailwind CSS, and REST API experience.",
+        "role_titles": ["Frontend Developer", "React Developer"],
+        "core_skills": ["React", "TypeScript", "Tailwind CSS", "HTML", "CSS"],
+        "additional_skills": ["REST API", "Next.js"],
+        "years_experience": 2.0,
+        "preferred_locations": ["Hyderabad"],
+        "work_preferences": ["Remote"],
+        "notable_projects": ["Interactive Dashboard Platform"],
+        "resume_source": "fixture"
+      },
+      "job_title": "Senior Java Backend Engineer",
+      "job_description": "Required: Java, Spring Boot, SQL, Docker, Kubernetes, AWS. Must have at least 5 years of experience building backend services.",
+      "max_score": 40,
+      "expected_blocker_risk": "High",
+      "required_missing_skills": ["java", "spring boot", "kubernetes"],
+      "expect_has_blockers": true
+    }
+  ],
+  "ranking_cases": [
+    {
+      "name": "frontend_profile_prefers_frontend_job",
+      "profile": {
+        "candidate_name": "Galla Chaitanya",
+        "professional_summary": "Frontend developer with React, TypeScript, Tailwind CSS, and REST API experience.",
+        "role_titles": ["Frontend Developer", "React Developer"],
+        "core_skills": ["React", "TypeScript", "Tailwind CSS", "HTML", "CSS"],
+        "additional_skills": ["REST API", "Next.js"],
+        "years_experience": 2.0,
+        "preferred_locations": ["Hyderabad"],
+        "work_preferences": ["Remote"],
+        "notable_projects": ["Interactive Dashboard Platform"],
+        "resume_source": "fixture"
+      },
+      "jobs": [
+        {
+          "title": "Frontend Developer",
+          "description": "Required: React, TypeScript, Tailwind CSS, HTML, CSS. Preferred: Next.js."
+        },
+        {
+          "title": "Backend Java Engineer",
+          "description": "Required: Java, Spring Boot, AWS, Docker. Must have 4+ years of experience."
+        },
+        {
+          "title": "QA Automation Engineer",
+          "description": "Required: Selenium, Java, CI/CD."
+        }
+      ],
+      "expected_top_job_title": "Frontend Developer"
+    }
+  ],
+  "experience_filter_cases": [
+    {
+      "name": "entry_level_filter_removes_senior_jobs",
+      "jobs": [
+        {
+          "title": "Senior Full Stack Engineer",
+          "snippet": "Build web applications with React and Node.js."
+        },
+        {
+          "title": "Lead Backend Developer",
+          "snippet": "Work on APIs and distributed systems."
+        },
+        {
+          "title": "Frontend Developer",
+          "snippet": "Freshers and entry level candidates can apply."
+        }
+      ],
+      "min_years": 0,
+      "max_years": 1,
+      "expected_matched_titles": ["Frontend Developer"],
+      "expected_fallback_titles": []
+    }
+  ]
+}
