@@ -45,3 +45,11 @@ Thumbs.db
 ~$*
 *.tmp
 *.log
+
+# Local project docs/assets not meant for GitHub
+architecture.excalidraw
+create_ppt.py
+JobScoutAgent_Complete_Guide.pptx
+Job_Scout_Full_Workflow_Documentation.docx
+LEARN_JobScoutAgent.docx
+LEARN.md
