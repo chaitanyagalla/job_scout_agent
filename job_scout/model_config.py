@@ -7,6 +7,8 @@ from collections.abc import Mapping
 DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 DEFAULT_GROQ_MODEL = "groq/llama-3.3-70b-versatile"
 DEFAULT_NVIDIA_MODEL = "nvidia_nim/nvidia/llama-3.3-nemotron-super-49b-v1.5"
+DEFAULT_MAX_OUTPUT_TOKENS = 2048
+DEFAULT_RESUME_PARSER_MAX_OUTPUT_TOKENS = 1024
 LITELLM_PROVIDER_PREFIXES = ("groq/", "anthropic/", "openai/", "nvidia_nim/")
 REASONING_MODEL_MARKERS = ("reasoning",)
 
@@ -85,6 +87,47 @@ def resolve_model_name(env: Mapping[str, str] | None = None) -> str:
 def uses_litellm(model_name: str) -> bool:
     """Return whether the model should be instantiated via LiteLLM."""
     return model_name.startswith(LITELLM_PROVIDER_PREFIXES)
+
+
+def _resolve_positive_int_setting(
+    env: Mapping[str, str],
+    setting_name: str,
+    default_value: int,
+) -> int:
+    raw_value = (env.get(setting_name) or "").strip()
+    if not raw_value:
+        return default_value
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default_value
+
+    return value if value > 0 else default_value
+
+
+def resolve_max_output_tokens(env: Mapping[str, str] | None = None) -> int:
+    env = env if env is not None else os.environ
+    return _resolve_positive_int_setting(
+        env,
+        "JOB_SCOUT_MAX_OUTPUT_TOKENS",
+        DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+
+
+def resolve_resume_parser_max_output_tokens(env: Mapping[str, str] | None = None) -> int:
+    env = env if env is not None else os.environ
+    return _resolve_positive_int_setting(
+        env,
+        "JOB_SCOUT_RESUME_PARSER_MAX_OUTPUT_TOKENS",
+        DEFAULT_RESUME_PARSER_MAX_OUTPUT_TOKENS,
+    )
+
+
+def resume_gemini_attachment_fallback_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether resume extraction may use native Gemini file parsing."""
+    env = env if env is not None else os.environ
+    return _env_flag_is_true(env.get("JOB_SCOUT_ENABLE_GEMINI_RESUME_FALLBACK"))
 
 
 def resolve_resume_parser_model(env: Mapping[str, str] | None = None) -> str:

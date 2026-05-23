@@ -1,6 +1,7 @@
 """Compatibility helpers for LiteLLM-backed tool calling."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Iterable
@@ -9,6 +10,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 CONTENT_NORMALIZATION_MODEL_PREFIXES = ("groq/", "nvidia_nim/")
 FILE_PART_UNSUPPORTED_PROVIDERS = {"nvidia_nim"}
+REGISTERED_TOOL_NAMES = {
+    "load_artifacts",
+    "get_resume_status",
+    "extract_resume_profile_from_artifact",
+    "save_resume_profile",
+    "clear_resume_profile",
+    "find_resume_matched_jobs",
+    "search_jobs",
+    "fetch_job_details",
+    "filter_saved_jobs_by_experience",
+    "score_job_match",
+}
 
 
 def _env_flag_is_true(value: str | None) -> bool:
@@ -245,6 +258,112 @@ def _repair_missing_tool_call_ids(messages: list[Any]) -> list[Any]:
     return messages
 
 
+def _repair_json_arguments_payload(arguments: Any) -> Any:
+    if not isinstance(arguments, str) or not arguments.strip():
+        return arguments
+
+    try:
+        json.loads(arguments)
+        return arguments
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    values = []
+    index = 0
+    length = len(arguments)
+
+    while index < length:
+        while index < length and arguments[index].isspace():
+            index += 1
+        if index >= length:
+            break
+
+        try:
+            value, end_index = decoder.raw_decode(arguments, index)
+        except json.JSONDecodeError:
+            break
+
+        values.append(value)
+        index = end_index
+
+    if not values:
+        return arguments
+
+    if all(isinstance(value, dict) for value in values):
+        merged: dict[str, Any] = {}
+        for value in values:
+            merged.update(value)
+        return json.dumps(merged)
+
+    return json.dumps(values[0])
+
+
+def _set_function_arguments(function_meta: Any, arguments: Any) -> None:
+    if isinstance(function_meta, dict):
+        function_meta["arguments"] = arguments
+        return
+
+    try:
+        function_meta["arguments"] = arguments
+        return
+    except Exception:
+        pass
+
+    setattr(function_meta, "arguments", arguments)
+
+
+def _set_function_name(function_meta: Any, name: str) -> None:
+    if isinstance(function_meta, dict):
+        function_meta["name"] = name
+        return
+
+    try:
+        function_meta["name"] = name
+        return
+    except Exception:
+        pass
+
+    setattr(function_meta, "name", name)
+
+
+def _repair_tool_call_name(name: Any) -> Any:
+    if not isinstance(name, str):
+        return name
+
+    normalized_name = name.strip()
+    if normalized_name in REGISTERED_TOOL_NAMES:
+        return normalized_name
+
+    for registered_name in REGISTERED_TOOL_NAMES:
+        if normalized_name == f"{registered_name}{registered_name}":
+            return registered_name
+
+    for registered_name in sorted(REGISTERED_TOOL_NAMES, key=len, reverse=True):
+        if normalized_name.startswith(registered_name) and normalized_name.endswith(registered_name):
+            middle = normalized_name[len(registered_name):-len(registered_name)]
+            if not middle:
+                return registered_name
+
+    return name
+
+
+def _repair_tool_call_arguments(message: Any) -> None:
+    for tool_call in _message_get(message, "tool_calls", []) or []:
+        function_meta = _message_get(tool_call, "function", {}) or {}
+        name = _message_get(function_meta, "name")
+        repaired_name = _repair_tool_call_name(name)
+        if repaired_name != name:
+            _set_function_name(function_meta, repaired_name)
+            logger.debug("Repaired malformed tool call name %s -> %s.", name, repaired_name)
+
+        arguments = _message_get(function_meta, "arguments")
+        repaired_arguments = _repair_json_arguments_payload(arguments)
+        if repaired_arguments != arguments:
+            _set_function_arguments(function_meta, repaired_arguments)
+            logger.debug("Repaired malformed tool call arguments JSON.")
+
+
 def patch_litellm_tool_call_id_repair() -> None:
     """Patch ADK's LiteLLM bridge to repair malformed tool result messages."""
     from google.adk.models import lite_llm as lite_llm_module
@@ -286,3 +405,17 @@ def patch_litellm_tool_call_id_repair() -> None:
 
         lite_llm_module._extract_reasoning_value = patched_extract_reasoning_value
         lite_llm_module._job_scout_reasoning_patch = True
+
+    if not getattr(lite_llm_module, "_job_scout_tool_argument_json_patch", False):
+        original_message_to_generate_content_response = (
+            lite_llm_module._message_to_generate_content_response
+        )
+
+        def patched_message_to_generate_content_response(message, **kwargs):
+            _repair_tool_call_arguments(message)
+            return original_message_to_generate_content_response(message, **kwargs)
+
+        lite_llm_module._message_to_generate_content_response = (
+            patched_message_to_generate_content_response
+        )
+        lite_llm_module._job_scout_tool_argument_json_patch = True

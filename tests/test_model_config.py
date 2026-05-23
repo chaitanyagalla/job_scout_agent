@@ -1,11 +1,16 @@
 from job_scout.model_config import DEFAULT_GEMINI_MODEL
 from job_scout.model_config import DEFAULT_GROQ_MODEL
+from job_scout.model_config import DEFAULT_MAX_OUTPUT_TOKENS
 from job_scout.model_config import DEFAULT_NVIDIA_MODEL
+from job_scout.model_config import DEFAULT_RESUME_PARSER_MAX_OUTPUT_TOKENS
 from job_scout.model_config import is_reasoning_model
+from job_scout.model_config import resolve_max_output_tokens
 from job_scout.model_config import resolve_model_name
 from job_scout.model_config import resolve_resume_attachment_model
+from job_scout.model_config import resolve_resume_parser_max_output_tokens
 from job_scout.model_config import resolve_resume_parser_model
 from job_scout.model_config import reasoning_models_allowed
+from job_scout.model_config import resume_gemini_attachment_fallback_enabled
 from job_scout.model_config import uses_litellm
 
 
@@ -107,6 +112,13 @@ def test_resume_attachment_model_still_prefers_native_gemini_for_file_parts():
     assert resolve_resume_attachment_model(env) == "gemini-2.5-flash"
 
 
+def test_resume_gemini_attachment_fallback_is_opt_in():
+    assert resume_gemini_attachment_fallback_enabled({}) is False
+    assert resume_gemini_attachment_fallback_enabled({
+        "JOB_SCOUT_ENABLE_GEMINI_RESUME_FALLBACK": "true"
+    }) is True
+
+
 def test_resume_parser_model_honors_explicit_parser_override():
     env = {
         "GOOGLE_API_KEY": "google-key",
@@ -115,3 +127,16 @@ def test_resume_parser_model_honors_explicit_parser_override():
     }
 
     assert resolve_resume_parser_model(env) == "groq/llama-3.3-70b-versatile"
+
+
+def test_max_output_tokens_can_be_configured():
+    assert resolve_max_output_tokens({"JOB_SCOUT_MAX_OUTPUT_TOKENS": "1536"}) == 1536
+    assert resolve_max_output_tokens({"JOB_SCOUT_MAX_OUTPUT_TOKENS": "0"}) == DEFAULT_MAX_OUTPUT_TOKENS
+    assert resolve_max_output_tokens({"JOB_SCOUT_MAX_OUTPUT_TOKENS": "bad"}) == DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def test_resume_parser_max_output_tokens_can_be_configured():
+    assert resolve_resume_parser_max_output_tokens({
+        "JOB_SCOUT_RESUME_PARSER_MAX_OUTPUT_TOKENS": "768"
+    }) == 768
+    assert resolve_resume_parser_max_output_tokens({}) == DEFAULT_RESUME_PARSER_MAX_OUTPUT_TOKENS

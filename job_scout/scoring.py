@@ -339,6 +339,54 @@ def _summarize_blocker_risk(
     return "Low"
 
 
+def _build_before_applying_actions(
+    *,
+    job_title: str,
+    matched_skills: list[str],
+    missing_required: list[str],
+    missing_preferred: list[str],
+    insufficient_experience: bool,
+    title_mismatch: bool,
+    required_years: Optional[float],
+    actual_years: Optional[float],
+) -> list[str]:
+    actions: list[str] = []
+    normalized_title = (job_title or "this role").strip() or "this role"
+
+    if title_mismatch:
+        actions.append(
+            f"Adjust the resume headline and summary toward {normalized_title} so the role match is clearer."
+        )
+
+    if matched_skills:
+        top_skills = ", ".join(matched_skills[:4])
+        actions.append(
+            f"Move project bullets using {top_skills} near the top of the resume and quantify the impact."
+        )
+
+    if missing_required:
+        gaps = ", ".join(missing_required[:3])
+        actions.append(
+            f"Review the required gap(s): {gaps}. Add honest evidence if you have it, or prepare a quick learning/project note."
+        )
+    elif missing_preferred:
+        gaps = ", ".join(missing_preferred[:3])
+        actions.append(
+            f"Prepare a short answer for preferred gap(s): {gaps}, since they may come up in screening."
+        )
+
+    if insufficient_experience and required_years is not None:
+        actual_text = "unknown" if actual_years is None else f"{actual_years:g}"
+        actions.append(
+            f"Be ready to explain the experience gap: resume shows {actual_text} years vs {required_years:g} years requested."
+        )
+
+    actions.append(
+        "Before applying, open the job URL and confirm the role is still active, remote/location terms match, and the experience requirement is acceptable."
+    )
+    return actions[:4]
+
+
 def build_profile_text(profile: dict | ResumeProfile) -> str:
     profile_model = _coerce_profile_for_scoring(profile)
     parts = [
@@ -465,6 +513,16 @@ def score_resume_vs_jd(job_title: str, job_description: str, profile: dict) -> d
         insufficient_experience,
         title_mismatch,
     )
+    before_applying = _build_before_applying_actions(
+        job_title=job_title,
+        matched_skills=matched_skills,
+        missing_required=missing_required,
+        missing_preferred=missing_preferred,
+        insufficient_experience=insufficient_experience,
+        title_mismatch=title_mismatch,
+        required_years=required_years,
+        actual_years=profile_model.years_experience,
+    )
 
     return JobMatchScore.model_validate({
         "score": score,
@@ -478,6 +536,7 @@ def score_resume_vs_jd(job_title: str, job_description: str, profile: dict) -> d
         },
         "matched_skills": matched_skills[:10],
         "missing_skills": missing_skills[:10],
+        "before_applying": before_applying,
         "explanation": " ".join(explanation_parts),
         "fit_verdict": fit_verdict,
         "reason_to_apply": reason_to_apply,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
@@ -15,7 +16,9 @@ from pydantic import Field
 from pydantic import ValidationError
 
 from job_scout.domain_models import ResumeProfile
+from job_scout.input_normalization import normalize_role_titles
 from job_scout.model_config import resolve_resume_attachment_model
+from job_scout.model_config import resolve_resume_parser_max_output_tokens
 from job_scout.model_config import resolve_resume_parser_model
 from job_scout.model_config import uses_litellm
 from job_scout.scoring import SKILL_ONTOLOGY
@@ -60,6 +63,14 @@ _PDF_STREAM_PATTERN = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.DOTALL)
 _PDF_LITERAL_TEXT_PATTERN = re.compile(r"\((?:\\.|[^\\)])*\)\s*(?:Tj|')", re.DOTALL)
 _PDF_ARRAY_TEXT_PATTERN = re.compile(r"\[(.*?)\]\s*TJ", re.DOTALL)
 _PDF_HEX_TEXT_PATTERN = re.compile(r"<([0-9A-Fa-f\s]+)>")
+_PDF_DIRECT_HEX_TEXT_PATTERN = re.compile(r"<([0-9A-Fa-f\s]+)>\s*(?:Tj|')", re.DOTALL)
+_PDF_BFCHAR_BLOCK_PATTERN = re.compile(r"beginbfchar(.*?)endbfchar", re.DOTALL)
+_PDF_BFRANGE_BLOCK_PATTERN = re.compile(r"beginbfrange(.*?)endbfrange", re.DOTALL)
+_PDF_HEX_PAIR_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>")
+_PDF_BFRANGE_ENTRY_PATTERN = re.compile(
+    r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<([0-9A-Fa-f]+)>|\[(.*?)\])",
+    re.DOTALL,
+)
 _SECTION_HEADING_ALIASES = {
     "professional summary": "professional_summary",
     "summary": "professional_summary",
@@ -236,6 +247,66 @@ def _safe_decode_text(data: bytes) -> str:
     return data.decode("latin-1", errors="replace")
 
 
+def _clean_extracted_text(text: str) -> str:
+    cleaned_lines = []
+    seen = set()
+    for raw_line in re.split(r"[\r\n]+", text or ""):
+        normalized = " ".join(raw_line.replace("\x00", " ").split())
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned_lines.append(normalized)
+    return "\n".join(cleaned_lines)
+
+
+def _extract_text_with_optional_pdf_parsers(pdf_bytes: bytes) -> str:
+    candidates: list[str] = []
+
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        candidates.append("\n".join(page.extract_text() or "" for page in reader.pages))
+    except Exception:
+        pass
+
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        candidates.append("\n".join(page.extract_text() or "" for page in reader.pages))
+    except Exception:
+        pass
+
+    try:
+        import fitz  # type: ignore
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+            candidates.append("\n".join(page.get_text("text") for page in document))
+    except Exception:
+        pass
+
+    try:
+        import pdfplumber  # type: ignore
+
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            candidates.append("\n".join(page.extract_text() or "" for page in pdf.pages))
+    except Exception:
+        pass
+
+    try:
+        from pdfminer.high_level import extract_text  # type: ignore
+
+        candidates.append(extract_text(io.BytesIO(pdf_bytes)))
+    except Exception:
+        pass
+
+    cleaned_candidates = [_clean_extracted_text(candidate) for candidate in candidates if candidate]
+    return max(cleaned_candidates, key=len, default="")
+
+
 def _artifact_part_to_bytes(artifact_part: genai_types.Part) -> tuple[Optional[bytes], Optional[str]]:
     file_data = getattr(artifact_part, "file_data", None)
     if file_data is not None:
@@ -325,10 +396,98 @@ def _decode_pdf_literal_string(token: str) -> str:
     return "".join(output)
 
 
-def _decode_pdf_hex_string(raw_hex: str) -> str:
+def _decode_pdf_cmap_value(raw_hex: str) -> str:
+    try:
+        decoded = bytes.fromhex(raw_hex)
+    except ValueError:
+        return ""
+    try:
+        return decoded.decode("utf-16-be")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return chr(int(raw_hex, 16))
+    except ValueError:
+        return ""
+
+
+def _extract_pdf_tounicode_map(stream_texts: list[str]) -> dict[str, str]:
+    cmap: dict[str, str] = {}
+    for stream_text in stream_texts:
+        for block_match in _PDF_BFCHAR_BLOCK_PATTERN.finditer(stream_text):
+            for source, destination in _PDF_HEX_PAIR_PATTERN.findall(block_match.group(1)):
+                decoded = _decode_pdf_cmap_value(destination)
+                if decoded:
+                    cmap[source.upper()] = decoded
+
+        for block_match in _PDF_BFRANGE_BLOCK_PATTERN.finditer(stream_text):
+            for match in _PDF_BFRANGE_ENTRY_PATTERN.finditer(block_match.group(1)):
+                source_start = match.group(1).upper()
+                source_end = match.group(2).upper()
+                destination_start = match.group(4)
+                destination_array = match.group(5)
+
+                try:
+                    start_value = int(source_start, 16)
+                    end_value = int(source_end, 16)
+                except ValueError:
+                    continue
+                if end_value < start_value or end_value - start_value > 512:
+                    continue
+
+                width = len(source_start)
+                if destination_array is not None:
+                    values = [
+                        _decode_pdf_cmap_value(value)
+                        for value in re.findall(r"<([0-9A-Fa-f]+)>", destination_array)
+                    ]
+                    for offset, decoded in enumerate(values[: end_value - start_value + 1]):
+                        if decoded:
+                            cmap[f"{start_value + offset:0{width}X}"] = decoded
+                    continue
+
+                if destination_start is None:
+                    continue
+                try:
+                    destination_value = int(destination_start, 16)
+                except ValueError:
+                    continue
+                for offset, source_value in enumerate(range(start_value, end_value + 1)):
+                    decoded = _decode_pdf_cmap_value(f"{destination_value + offset:04X}")
+                    if decoded:
+                        cmap[f"{source_value:0{width}X}"] = decoded
+
+    return cmap
+
+
+def _decode_pdf_hex_with_cmap(cleaned_hex: str, cmap: dict[str, str]) -> str:
+    if not cmap:
+        return ""
+    output = []
+    index = 0
+    key_lengths = sorted({len(key) for key in cmap}, reverse=True)
+    while index < len(cleaned_hex):
+        matched = False
+        for key_length in key_lengths:
+            key = cleaned_hex[index:index + key_length].upper()
+            if key in cmap:
+                output.append(cmap[key])
+                index += key_length
+                matched = True
+                break
+        if not matched:
+            index += 2
+    return "".join(output)
+
+
+def _decode_pdf_hex_string(raw_hex: str, cmap: Optional[dict[str, str]] = None) -> str:
     cleaned = re.sub(r"\s+", "", raw_hex)
     if len(cleaned) % 2 == 1:
         cleaned += "0"
+    if cmap:
+        mapped = _decode_pdf_hex_with_cmap(cleaned, cmap)
+        if mapped.strip():
+            return mapped
     try:
         decoded = bytes.fromhex(cleaned)
     except ValueError:
@@ -339,12 +498,20 @@ def _decode_pdf_hex_string(raw_hex: str) -> str:
         return _safe_decode_text(decoded)
 
 
-def _extract_text_from_pdf_stream_text(stream_text: str) -> list[str]:
+def _extract_text_from_pdf_stream_text(
+    stream_text: str,
+    cmap: Optional[dict[str, str]] = None,
+) -> list[str]:
     fragments: list[str] = []
     for match in _PDF_LITERAL_TEXT_PATTERN.finditer(stream_text):
         text = _decode_pdf_literal_string(match.group(0))
         if text.strip():
             fragments.append(text.strip())
+
+    for match in _PDF_DIRECT_HEX_TEXT_PATTERN.finditer(stream_text):
+        decoded = _decode_pdf_hex_string(match.group(1), cmap)
+        if decoded.strip():
+            fragments.append(decoded.strip())
 
     for match in _PDF_ARRAY_TEXT_PATTERN.finditer(stream_text):
         array_body = match.group(1)
@@ -354,7 +521,7 @@ def _extract_text_from_pdf_stream_text(stream_text: str) -> list[str]:
             if decoded:
                 pieces.append(decoded)
         for hex_match in _PDF_HEX_TEXT_PATTERN.finditer(array_body):
-            decoded = _decode_pdf_hex_string(hex_match.group(1))
+            decoded = _decode_pdf_hex_string(hex_match.group(1), cmap)
             if decoded:
                 pieces.append(decoded)
         joined = " ".join(piece.strip() for piece in pieces if piece.strip())
@@ -365,7 +532,9 @@ def _extract_text_from_pdf_stream_text(stream_text: str) -> list[str]:
 
 
 def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    optional_parser_text = _extract_text_with_optional_pdf_parsers(pdf_bytes)
     fragments: list[str] = []
+    stream_texts: list[str] = []
     for match in _PDF_STREAM_PATTERN.finditer(pdf_bytes):
         stream_data = match.group(1)
         candidate_streams = [stream_data]
@@ -376,24 +545,24 @@ def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
 
         for candidate in candidate_streams:
             stream_text = _safe_decode_text(candidate)
-            fragments.extend(_extract_text_from_pdf_stream_text(stream_text))
+            stream_texts.append(stream_text)
+
+    cmap = _extract_pdf_tounicode_map(stream_texts)
+    for stream_text in stream_texts:
+        fragments.extend(_extract_text_from_pdf_stream_text(stream_text, cmap))
 
     if not fragments:
         raw_text = _safe_decode_text(pdf_bytes)
-        fragments.extend(_extract_text_from_pdf_stream_text(raw_text))
+        fragments.extend(_extract_text_from_pdf_stream_text(raw_text, cmap))
 
-    cleaned_lines = []
-    seen = set()
-    for fragment in fragments:
-        normalized = " ".join(fragment.replace("\x00", " ").split())
-        if not normalized:
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        cleaned_lines.append(normalized)
+    extracted_text = _clean_extracted_text("\n".join(fragments))
+    if optional_parser_text and (
+        _looks_like_resume_text(optional_parser_text)
+        or len(optional_parser_text) > len(extracted_text)
+    ):
+        return optional_parser_text
 
-    return "\n".join(cleaned_lines)
+    return extracted_text
 
 
 def _looks_like_resume_text(text: str) -> bool:
@@ -635,19 +804,29 @@ def _part_looks_like_resume_upload(part: object, fallback_index: int = 0) -> boo
         mime_type = (getattr(inline_data, "mime_type", None) or "").split(";", 1)[0].strip().lower()
         if mime_type in _SUPPORTED_RESUME_MIME_TYPES:
             return True
+        display_name = getattr(inline_data, "display_name", None)
+        if display_name:
+            return bool(_choose_resume_artifact_name([str(display_name)]))
+        return False
 
     file_data = getattr(part, "file_data", None)
     if file_data is not None:
         mime_type = (getattr(file_data, "mime_type", None) or "").split(";", 1)[0].strip().lower()
         if mime_type in _SUPPORTED_RESUME_MIME_TYPES:
             return True
+        display_name = getattr(file_data, "display_name", None)
+        if display_name and _choose_resume_artifact_name([str(display_name)]):
+            return True
         file_uri = getattr(file_data, "file_uri", None)
         if file_uri and artifact_util.parse_artifact_uri(str(file_uri)):
-            filename = _resume_part_display_name(part, fallback_index=fallback_index)
+            parsed_uri = artifact_util.parse_artifact_uri(str(file_uri))
+            return bool(parsed_uri and _choose_resume_artifact_name([parsed_uri.filename]))
+        if file_uri and str(file_uri).startswith("artifact://"):
+            filename = str(file_uri).rsplit("/", 1)[-1]
             return bool(_choose_resume_artifact_name([filename]))
+        return False
 
-    filename = _resume_part_display_name(part, fallback_index=fallback_index)
-    return bool(_choose_resume_artifact_name([filename]))
+    return False
 
 
 def _extract_resume_parts_from_user_content(
@@ -666,7 +845,7 @@ def _extract_resume_parts_from_user_content(
 
 
 def _enrich_role_titles_from_skills(role_titles: list[str], skills: list[str]) -> list[str]:
-    enriched_roles = list(role_titles)
+    enriched_roles = normalize_role_titles(role_titles)
     normalized_skills = {skill.strip().lower() for skill in skills if skill.strip()}
 
     has_frontend = bool(normalized_skills & _FRONTEND_ROLE_SKILLS)
@@ -683,7 +862,7 @@ def _enrich_role_titles_from_skills(role_titles: list[str], skills: list[str]) -
         if any(skill in normalized_skills for skill in ("node.js", "node", "express", "express.js")):
             enriched_roles.append("Node.js Developer")
 
-    return _sort_role_titles(enriched_roles)
+    return _sort_role_titles(normalize_role_titles(enriched_roles))
 
 
 def _normalize_resume_profile_payload(payload: dict, *, resume_source: str) -> dict:
@@ -695,7 +874,7 @@ def _normalize_resume_profile_payload(payload: dict, *, resume_source: str) -> d
             "candidate_name": _clean_resume_scalar(payload.get("candidate_name")),
             "professional_summary": _clean_resume_scalar(payload.get("professional_summary")),
             "role_titles": _enrich_role_titles_from_skills(
-                _clean_resume_items(payload.get("role_titles", [])),
+                normalize_role_titles(_clean_resume_items(payload.get("role_titles", []))),
                 core_skills + additional_skills,
             ),
             "core_skills": core_skills,
@@ -741,10 +920,24 @@ def _extract_resume_profile_locally(
         extracted_text = _safe_decode_text(artifact_bytes)
 
     if not _looks_like_resume_text(extracted_text):
+        best_effort_profile = None
+        try:
+            best_effort_profile = _normalize_resume_profile_payload(
+                _parse_resume_text_locally(extracted_text),
+                resume_source=artifact_name,
+            )
+        except ValueError:
+            best_effort_profile = None
+
         return {
             "status": "error",
             "message": "Local resume text extraction was too weak to trust.",
             "resume_text": extracted_text,
+            "best_effort_profile": (
+                best_effort_profile
+                if best_effort_profile and _profile_has_meaningful_resume_signal(best_effort_profile)
+                else None
+            ),
         }
 
     parsed = _parse_resume_text_locally(extracted_text)
@@ -881,32 +1074,18 @@ async def _parse_resume_with_text_model(artifact_name: str, resume_text: str) ->
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
+            max_tokens=resolve_resume_parser_max_output_tokens(),
         )
         response_text = _llm_response_text(response)
         return _coerce_resume_parser_payload(
             _extract_json_object_from_text(response_text)
         )
 
-    api_key = (os.getenv("GOOGLE_API_KEY") or "").strip()
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is required for native Gemini resume parsing.")
-
-    client = genai.Client(api_key=api_key)
-    response = await client.aio.models.generate_content(
-        model=parser_model,
-        contents=[prompt],
-        config=genai_types.GenerateContentConfig(
-            temperature=0,
-            response_mime_type="application/json",
-            response_schema=ResumeProfileExtraction,
-        ),
+    raise ValueError(
+        "Native Gemini resume text parsing is disabled. Configure "
+        "JOB_SCOUT_RESUME_PARSER_MODEL to a LiteLLM provider such as "
+        "nvidia_nim/... or groq/... for model-based resume parsing."
     )
-    parsed = response.parsed
-    if isinstance(parsed, ResumeProfileExtraction):
-        return parsed.model_dump()
-    if parsed is not None:
-        return ResumeProfileExtraction.model_validate(parsed).model_dump()
-    return ResumeProfileExtraction.model_validate_json(response.text).model_dump()
 
 
 async def _parse_resume_with_gemini(artifact_name: str, artifact_part: genai_types.Part) -> dict:
@@ -923,6 +1102,7 @@ async def _parse_resume_with_gemini(artifact_name: str, artifact_part: genai_typ
         contents=[prompt, _sanitize_part_for_gemini(artifact_part)],
         config=genai_types.GenerateContentConfig(
             temperature=0,
+            max_output_tokens=resolve_resume_parser_max_output_tokens(),
             response_mime_type="application/json",
             response_schema=ResumeProfileExtraction,
         ),

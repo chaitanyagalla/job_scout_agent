@@ -80,6 +80,7 @@ class JobMatchScore(BaseModel):
     signals: JobMatchSignals
     matched_skills: list[str] = Field(default_factory=list)
     missing_skills: list[str] = Field(default_factory=list)
+    before_applying: list[str] = Field(default_factory=list)
     explanation: str = ""
     resume_source: Optional[str] = None
     evidence: JobMatchEvidence = Field(default_factory=JobMatchEvidence)

@@ -12,9 +12,11 @@ from job_scout.resume_tools import _extract_resume_profile_payload_from_artifact
 from job_scout.resume_tools import _persist_resume_profile
 from job_scout.resume_tools import clear_resume_profile
 from job_scout.resume_tools import extract_resume_profile_from_artifact
+from job_scout.resume_tools import find_resume_matched_jobs
 from job_scout.resume_tools import get_resume_status
 from job_scout.resume_tools import save_resume_profile
 from job_scout.resume_tools import score_job_match
+from job_scout.resume_tools import score_saved_jobs
 from job_scout.search_support import _filter_jobs_for_experience
 from job_scout.search_support import _normalize_country
 from job_scout.search_support import fetch_job_details
@@ -44,8 +46,10 @@ __all__ = [
     "extract_resume_profile_from_artifact",
     "fetch_job_details",
     "filter_saved_jobs_by_experience",
+    "find_resume_matched_jobs",
     "get_resume_status",
     "save_resume_profile",
     "score_job_match",
+    "score_saved_jobs",
     "search_jobs",
 ]

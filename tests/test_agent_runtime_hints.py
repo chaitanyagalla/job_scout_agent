@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from job_scout.agent import add_runtime_hints
+from job_scout.agent import _resolve_gemini_fallback_model_name
 from job_scout.agent import root_agent
 from google.adk.models.llm_request import LlmRequest
 from google.genai import types
@@ -105,3 +106,10 @@ def test_root_agent_instruction_requires_showing_jobs_without_extra_confirmation
     assert "immediately instead of asking whether the user wants to see them" in instruction
     assert "do not ask for extra confirmation before showing results already fetched" in instruction
     assert 'Never ask a follow-up like "Would you like me to show the results?"' in instruction
+
+
+def test_resolve_gemini_fallback_model_name_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setenv("JOB_SCOUT_DISABLE_MODEL_FALLBACK", "true")
+
+    assert _resolve_gemini_fallback_model_name() is None

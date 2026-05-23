@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from google.adk.tools.tool_context import ToolContext
 
 from job_scout.domain_models import JobMatchScore
+from job_scout.domain_models import JobPosting
 from job_scout.domain_models import ResumeProfile
 from job_scout import resume_support
+from job_scout.model_config import resume_gemini_attachment_fallback_enabled
 from job_scout.scoring import score_resume_vs_jd
+from job_scout.search_support import fetch_job_details
+from job_scout.state_keys import LAST_SEARCH_RESULTS_STATE_KEY
 from job_scout.state_keys import RESUME_PROFILE_EXTRACTION_METHOD_STATE_KEY
 from job_scout.state_keys import RESUME_PROFILE_STATE_KEY
+from job_scout.search_tools import search_jobs
 
 
 async def _load_resume_part_from_current_user_message(
@@ -180,6 +186,7 @@ async def _extract_resume_profile_payload_from_artifact(
 
     text_fallback_error: Optional[str] = None
     profile = None
+    extraction_method = None
 
     resume_text = (local_result.get("resume_text") or "").strip()
     if resume_text:
@@ -197,9 +204,16 @@ async def _extract_resume_profile_payload_from_artifact(
             text_fallback_error = str(exc)
 
     if profile is None:
+        best_effort_profile = local_result.get("best_effort_profile")
+        if best_effort_profile:
+            profile = best_effort_profile
+            extraction_method = "local_best_effort"
+
+    if profile is None and resume_gemini_attachment_fallback_enabled():
         try:
             extracted = await resume_support._parse_resume_with_gemini(selected_artifact, artifact_part)
             profile = _normalize_extracted_profile(extracted)
+            extraction_method = "gemini_attachment_fallback"
             if profile is None:
                 return {
                     "status": "error",
@@ -223,11 +237,34 @@ async def _extract_resume_profile_payload_from_artifact(
                 "details": details,
             }
 
+    if profile is None:
+        details = []
+        if local_result.get("message"):
+            details.append(f"local extraction: {local_result['message']}")
+        if text_fallback_error:
+            details.append(f"text-model fallback: {text_fallback_error}")
+        details.append(
+            "gemini attachment fallback: disabled by JOB_SCOUT_ENABLE_GEMINI_RESUME_FALLBACK"
+        )
+        return {
+            "status": "error",
+            "message": (
+                "Resume parsing failed without using Gemini. Try uploading a text-based "
+                "PDF/DOCX, install an optional PDF parser such as pypdf, or configure a "
+                "non-Gemini resume parser model."
+            ),
+            "resume_source": selected_artifact,
+            "details": details,
+        }
+
     return {
         "status": "ok",
         "profile": profile,
         "resume_source": profile["resume_source"],
-        "extraction_method": "llm_text_fallback" if text_fallback_error is None and resume_text else "gemini_attachment_fallback",
+        "extraction_method": (
+            extraction_method
+            or ("llm_text_fallback" if text_fallback_error is None and resume_text else "local_best_effort")
+        ),
     }
 
 
@@ -264,9 +301,11 @@ async def get_resume_status(tool_context: ToolContext) -> dict:
         A small status payload indicating whether a resume profile is loaded,
         along with basic metadata when it exists.
     """
-    profile = await _ensure_resume_profile(tool_context)
+    profile = tool_context.state.get(RESUME_PROFILE_STATE_KEY)
     if not profile:
         return {"status": "missing", "resume_loaded": False}
+
+    profile = ResumeProfile.model_validate(profile).model_dump()
 
     return {
         "status": "ok",
@@ -403,3 +442,221 @@ async def score_job_match(job_title: str, job_description: str, tool_context: To
     )
     result["resume_source"] = profile.get("resume_source")
     return JobMatchScore.model_validate(result).model_dump(exclude_none=True)
+
+
+def _infer_search_role_from_profile(profile: dict) -> str:
+    role_titles = [role.strip() for role in profile.get("role_titles", []) if role and role.strip()]
+    if role_titles:
+        return ", ".join(role_titles[:3])
+
+    skills = [skill.strip() for skill in profile.get("core_skills", []) if skill and skill.strip()]
+    if any("react" in skill.lower() for skill in skills):
+        return "Frontend Developer"
+    if any("node" in skill.lower() for skill in skills):
+        return "Backend Developer"
+    return "Software Developer"
+
+
+def _infer_search_location_from_profile(profile: dict) -> str:
+    locations = [location.strip() for location in profile.get("preferred_locations", []) if location and location.strip()]
+    if locations:
+        return locations[0]
+    return "Remote"
+
+
+def _job_description_needs_expansion(job: dict) -> bool:
+    description = (job.get("description") or "").strip()
+    if len(description) >= 500:
+        return False
+
+    snippet = (job.get("snippet") or "").strip()
+    if len(snippet) < 180:
+        return True
+
+    vague_markers = (
+        "see job description",
+        "click to apply",
+        "read more",
+        "apply now",
+    )
+    snippet_lower = snippet.lower()
+    return any(marker in snippet_lower for marker in vague_markers)
+
+
+def _summarize_job_description_for_output(job_description: str, *, max_chars: int = 420) -> str:
+    cleaned = " ".join((job_description or "").split())
+    if not cleaned:
+        return ""
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", cleaned)
+        if sentence.strip()
+    ]
+    summary = " ".join(sentences[:3]) if sentences else cleaned
+    if len(summary) <= max_chars:
+        return summary
+    return summary[:max_chars].rsplit(" ", 1)[0].rstrip(".,;:") + "..."
+
+
+def _score_job_payload_against_profile(job: dict, profile: dict) -> dict:
+    enriched_job = dict(job)
+
+    if enriched_job.get("url") and _job_description_needs_expansion(enriched_job):
+        details = fetch_job_details(enriched_job["url"])
+        if details.get("status") == "ok":
+            description = (details.get("description") or "").strip()
+            if description:
+                enriched_job["description"] = description[:4000]
+
+    job_description = (
+        (enriched_job.get("description") or "").strip()
+        or (enriched_job.get("snippet") or "").strip()
+    )
+    score_result = score_resume_vs_jd(
+        job_title=enriched_job.get("title", ""),
+        job_description=job_description,
+        profile=profile,
+    )
+    score_result["resume_source"] = profile.get("resume_source")
+    normalized_score = JobMatchScore.model_validate(score_result).model_dump(exclude_none=True)
+
+    return JobPosting.model_validate({
+        **enriched_job,
+        "description": enriched_job.get("description"),
+    }).model_dump(exclude_none=True) | {
+        "apply_url": enriched_job.get("url"),
+        "job_description_summary": _summarize_job_description_for_output(job_description),
+        "score": normalized_score["score"],
+        "matched_skills": normalized_score.get("matched_skills", []),
+        "missing_skills": normalized_score.get("missing_skills", []),
+        "fit_verdict": normalized_score.get("fit_verdict"),
+        "reason_to_apply": normalized_score.get("reason_to_apply"),
+        "before_applying": normalized_score.get("before_applying", []),
+        "blocker_risk": normalized_score.get("blocker_risk"),
+        "score_explanation": normalized_score.get("explanation", ""),
+        "score_signals": normalized_score.get("signals", {}),
+        "score_evidence": normalized_score.get("evidence", {}),
+        "score_blockers": normalized_score.get("blockers", {}),
+    }
+
+
+async def score_saved_jobs(tool_context: ToolContext) -> dict:
+    """Score every job from the most recent saved search against the resume.
+
+    Use this for follow-ups like "score all these jobs" after a job search has
+    already returned results. It preserves the job URL, company, location,
+    description context, score evidence, and before-applying guidance.
+    """
+    profile = await _ensure_resume_profile(tool_context)
+    if not profile:
+        return {
+            "status": "error",
+            "message": (
+                "No resume profile is loaded yet, so saved jobs cannot be scored. "
+                "Upload or save a resume profile first."
+            ),
+            "jobs": [],
+        }
+
+    saved_search = tool_context.state.get(LAST_SEARCH_RESULTS_STATE_KEY)
+    saved_jobs = (saved_search or {}).get("jobs", [])
+    if not saved_jobs:
+        return {
+            "status": "error",
+            "message": "No saved job search results are available to score. Search for jobs first.",
+            "jobs": [],
+        }
+
+    scored_jobs = [
+        _score_job_payload_against_profile(dict(job), profile)
+        for job in saved_jobs
+    ]
+    scored_jobs.sort(key=lambda job: job.get("score", 0), reverse=True)
+
+    return {
+        "status": "ok",
+        "message": f"Scored all {len(scored_jobs)} saved jobs against the resume.",
+        "candidate_name": profile.get("candidate_name"),
+        "resume_source": profile.get("resume_source"),
+        "extraction_method": tool_context.state.get(RESUME_PROFILE_EXTRACTION_METHOD_STATE_KEY),
+        "search_context": {
+            "role": (saved_search or {}).get("role"),
+            "expanded_roles": (saved_search or {}).get("expanded_roles", []),
+            "location": (saved_search or {}).get("location"),
+            "country": (saved_search or {}).get("country"),
+        },
+        "jobs": scored_jobs,
+    }
+
+
+async def find_resume_matched_jobs(
+    location: Optional[str] = None,
+    role: Optional[str] = None,
+    max_results: int = 25,
+    country: Optional[str] = None,
+    min_years: Optional[float] = None,
+    max_years: Optional[float] = None,
+    tool_context: Optional[ToolContext] = None,
+) -> dict:
+    """Run resume extraction/restoration, job search, and scoring in one tool call.
+
+    Use this when the user wants jobs matched according to an uploaded or saved
+    resume. This is especially useful with providers that are less reliable at
+    multi-step tool chaining.
+    """
+    if tool_context is None:
+        return {
+            "status": "error",
+            "message": "Tool context is required for resume-based job matching.",
+            "jobs": [],
+        }
+
+    profile = await _ensure_resume_profile(tool_context)
+    if not profile:
+        return {
+            "status": "error",
+            "message": (
+                "No resume profile is loaded yet, and no uploaded resume artifact "
+                "could be restored for matching. Upload a resume first or save a "
+                "structured profile with `save_resume_profile`."
+            ),
+            "jobs": [],
+        }
+
+    resolved_role = (role or "").strip() or _infer_search_role_from_profile(profile)
+    resolved_location = (location or "").strip() or _infer_search_location_from_profile(profile)
+
+    search_result = search_jobs(
+        role=resolved_role,
+        location=resolved_location,
+        max_results=max_results,
+        country=country,
+        min_years=min_years,
+        max_years=max_years,
+        tool_context=tool_context,
+    )
+    if search_result.get("status") not in {"ok", "demo_mode"}:
+        return search_result
+
+    ranked_jobs = []
+    for raw_job in search_result.get("jobs", []):
+        ranked_jobs.append(_score_job_payload_against_profile(dict(raw_job), profile))
+
+    ranked_jobs.sort(key=lambda job: job.get("score", 0), reverse=True)
+
+    return {
+        "status": search_result.get("status", "ok"),
+        "message": (
+            f"Found {len(ranked_jobs)} resume-matched jobs for {resolved_role} in {resolved_location}."
+        ),
+        "candidate_name": profile.get("candidate_name"),
+        "resume_source": profile.get("resume_source"),
+        "extraction_method": tool_context.state.get(RESUME_PROFILE_EXTRACTION_METHOD_STATE_KEY),
+        "role_used": resolved_role,
+        "location_used": resolved_location,
+        "provider": search_result.get("provider"),
+        "expanded_roles": search_result.get("expanded_roles", []),
+        "experience_filter": search_result.get("experience_filter"),
+        "jobs": ranked_jobs,
+    }

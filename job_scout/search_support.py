@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+DEFAULT_APIFY_ACTOR_TIMEOUT_SECONDS = 300
+DEFAULT_APIFY_HTTP_TIMEOUT_SECONDS = 360
+
 _EXPERIENCE_RANGE_PATTERNS = [
     re.compile(r"(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)\s+years?"),
     re.compile(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s+yrs?"),
@@ -35,6 +38,33 @@ _REMOTE_LOCATION_TERMS = (
     "wfh",
     "anywhere",
 )
+
+
+def _resolve_positive_int_env(name: str, default_value: int) -> int:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default_value
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default_value
+    return value if value > 0 else default_value
+
+
+def _resolve_apify_actor_timeout_seconds() -> int:
+    return _resolve_positive_int_env(
+        "JOB_SCOUT_APIFY_ACTOR_TIMEOUT_SECONDS",
+        DEFAULT_APIFY_ACTOR_TIMEOUT_SECONDS,
+    )
+
+
+def _resolve_apify_http_timeout_seconds() -> int:
+    actor_timeout = _resolve_apify_actor_timeout_seconds()
+    configured_timeout = _resolve_positive_int_env(
+        "JOB_SCOUT_APIFY_HTTP_TIMEOUT_SECONDS",
+        DEFAULT_APIFY_HTTP_TIMEOUT_SECONDS,
+    )
+    return max(configured_timeout, actor_timeout + 30)
 _REMOTE_JOB_TERMS = (
     "remote",
     "work from home",
@@ -45,6 +75,43 @@ _REMOTE_JOB_TERMS = (
 _SENIOR_LEVEL_TERMS = (
     "senior", "sr.", "sr ", "lead", "principal", "staff engineer",
     "architect", "manager", "head of",
+)
+_MERN_ROLE_TERMS = (
+    "mern",
+    "full stack",
+    "fullstack",
+    "react",
+    "node",
+    "node.js",
+    "javascript",
+    "typescript",
+    "web developer",
+)
+_GENAI_ROLE_TERMS = (
+    "genai",
+    "gen ai",
+    "generative ai",
+    "llm",
+    "large language model",
+    "prompt engineer",
+    "machine learning",
+    "ml engineer",
+    "nlp",
+)
+_MERN_UNRELATED_TITLE_TERMS = (
+    "php",
+    "laravel",
+    "codeigniter",
+    "rpa",
+    "content developer",
+    "curriculum",
+)
+_GENAI_UNRELATED_TITLE_TERMS = (
+    "content developer",
+    "curriculum",
+    "rpa",
+    "php",
+    "laravel",
 )
 _COUNTRY_CODE_ALIASES = {
     "US": {"us", "usa"},
@@ -211,6 +278,58 @@ def _build_position_query(role: str, min_years: Optional[float], max_years: Opti
     return role
 
 
+def _with_experience_terms(query: str, min_years: Optional[float], max_years: Optional[float]) -> str:
+    query = " ".join((query or "").split())
+    if max_years is not None and max_years <= 1:
+        return f"{query} fresher entry level junior"
+    if max_years is not None and max_years <= 2:
+        return f"{query} junior entry level"
+    return query
+
+
+def _build_position_query_variants(
+    role: str,
+    min_years: Optional[float],
+    max_years: Optional[float],
+) -> list[str]:
+    role = " ".join((role or "").split())
+    family = _requested_role_family(role)
+    if family == "mern":
+        base_queries = [
+            role,
+            "MERN Stack Developer",
+            "Full Stack Developer React Node",
+            "React Node.js Developer",
+        ]
+    elif family == "genai":
+        base_queries = [
+            role,
+            "AI Engineer",
+            "Generative AI Engineer",
+            "LLM Engineer",
+            "Machine Learning Engineer",
+            "Prompt Engineer",
+        ]
+    else:
+        base_queries = [role]
+
+    seen = set()
+    queries = []
+    for query in base_queries:
+        normalized_query = _with_experience_terms(query, min_years, max_years)
+        key = normalized_query.lower()
+        if not normalized_query or key in seen:
+            continue
+        seen.add(key)
+        queries.append(normalized_query)
+    return queries or [_build_position_query(role, min_years, max_years)]
+
+
+def _provider_fetch_limit(max_results: int) -> int:
+    configured_limit = int(os.getenv("JOB_SCOUT_PROVIDER_FETCH_LIMIT") or "50")
+    return min(max(max_results * 5, max_results), configured_limit)
+
+
 def _merge_job_lists(job_groups: list[list[dict]], max_results: int) -> list[dict]:
     merged = []
     seen = set()
@@ -230,6 +349,110 @@ def _merge_job_lists(job_groups: list[list[dict]], max_results: int) -> list[dic
                 return merged
 
     return merged
+
+
+def _requested_role_family(role: str) -> Optional[str]:
+    normalized = " ".join((role or "").lower().split())
+    if any(term in normalized for term in ("mern", "full stack", "fullstack", "react", "node")):
+        return "mern"
+    if any(
+        term in normalized
+        for term in (
+            "genai",
+            "gen ai",
+            "generative ai",
+            "llm",
+            "ai engineer",
+            "machine learning",
+            "ml engineer",
+            "prompt engineer",
+        )
+    ):
+        return "genai"
+    return None
+
+
+def _role_relevance_score(job: dict, role: str) -> int:
+    family = _requested_role_family(role)
+    if family is None:
+        return 1
+
+    title = (job.get("title") or "").lower()
+    combined_text = " ".join(
+        part for part in (
+            job.get("title", ""),
+            job.get("snippet", ""),
+            job.get("description", ""),
+        )
+        if part
+    ).lower()
+
+    if family == "mern":
+        score = 0
+        if "mern" in title:
+            score += 5
+        if "full stack" in title or "fullstack" in title:
+            score += 4
+        if any(term in title for term in ("react", "node", "node.js", "web developer")):
+            score += 3
+        if "mern" in combined_text:
+            score += 4
+        if "react" in combined_text and ("node" in combined_text or "node.js" in combined_text):
+            score += 3
+        if any(term in combined_text for term in _MERN_ROLE_TERMS):
+            score += 1
+        if any(term in title for term in _MERN_UNRELATED_TITLE_TERMS):
+            score -= 4
+        return score
+
+    score = 0
+    if any(term in title for term in ("genai", "gen ai", "generative ai", "llm")):
+        score += 5
+    if any(term in title for term in ("ai engineer", "ml engineer", "machine learning", "nlp", "prompt")):
+        score += 4
+    if any(term in combined_text for term in _GENAI_ROLE_TERMS):
+        score += 2
+    if any(term in title for term in _GENAI_UNRELATED_TITLE_TERMS):
+        score -= 4
+    return score
+
+
+def _rank_jobs_for_requested_role(jobs: list[dict], role: str) -> list[dict]:
+    family = _requested_role_family(role)
+    if family is None:
+        return jobs
+
+    scored_jobs = [
+        (_role_relevance_score(job, role), index, job)
+        for index, job in enumerate(jobs)
+    ]
+    relevant_jobs = [
+        (score, index, job)
+        for score, index, job in scored_jobs
+        if score > 0
+    ]
+    if not relevant_jobs:
+        return []
+
+    relevant_jobs.sort(key=lambda item: (-item[0], item[1]))
+    return [job for _, _, job in relevant_jobs]
+
+
+def _select_jobs_for_requested_experience(
+    jobs: list[dict],
+    min_years: Optional[float],
+    max_years: Optional[float],
+    max_results: int,
+) -> list[dict]:
+    filtered_jobs, fallback_jobs = _filter_jobs_for_experience(jobs, min_years, max_years)
+
+    if max_years is not None and max_years <= 1:
+        return filtered_jobs[:max_results]
+
+    return _merge_job_lists(
+        [filtered_jobs, fallback_jobs, jobs],
+        max_results=max_results,
+    )
 
 
 def _filter_jobs_for_experience(
@@ -281,6 +504,10 @@ def _filter_jobs_for_experience(
 
 
 def _resolve_job_search_provider() -> str:
+    return _resolve_job_search_providers()[0]
+
+
+def _resolve_job_search_providers() -> list[str]:
     preferred_provider = (os.getenv("JOB_SCOUT_JOB_SEARCH_PROVIDER") or "").strip().lower()
     apify_token = (os.getenv("APIFY_TOKEN") or "").strip()
     adzuna_app_id = (os.getenv("ADZUNA_APP_ID") or "").strip()
@@ -288,19 +515,24 @@ def _resolve_job_search_provider() -> str:
     browseract_api_key = (os.getenv("BROWSERACT_API_KEY") or "").strip()
     browseract_workflow_id = (os.getenv("BROWSERACT_WORKFLOW_ID") or "").strip()
 
-    if preferred_provider == "adzuna":
-        return "adzuna"
-    if preferred_provider == "apify":
-        return "apify"
-    if preferred_provider == "browseract":
-        return "browseract"
-    if browseract_api_key and browseract_workflow_id:
-        return "browseract"
-    if adzuna_app_id and adzuna_app_key:
-        return "adzuna"
-    if apify_token:
-        return "apify"
-    return "demo"
+    provider_credentials = {
+        "browseract": bool(browseract_api_key and browseract_workflow_id),
+        "adzuna": bool(adzuna_app_id and adzuna_app_key),
+        "apify": bool(apify_token),
+    }
+
+    if preferred_provider in provider_credentials and not provider_credentials[preferred_provider]:
+        return ["demo"]
+
+    providers = []
+    if provider_credentials.get(preferred_provider):
+        providers.append(preferred_provider)
+
+    for provider in ("browseract", "adzuna", "apify"):
+        if provider_credentials[provider] and provider not in providers:
+            providers.append(provider)
+
+    return providers or ["demo"]
 
 
 def _resolve_adzuna_country(resolved_country: Optional[str]) -> str:
@@ -371,70 +603,88 @@ def _search_jobs_once_adzuna(
     adzuna_app_id: str,
     adzuna_app_key: str,
 ) -> dict:
-    position_query = _build_position_query(role, min_years, max_years)
+    position_queries = _build_position_query_variants(role, min_years, max_years)
     country_code = _resolve_adzuna_country(resolved_country)
     url = f"https://api.adzuna.com/v1/api/jobs/{country_code}/search/1"
-    search_requests = _build_adzuna_search_requests(
-        position_query=position_query,
-        location=location,
-        country_code=country_code,
-    )
 
-    last_jobs: list[dict] = []
-    last_query_used = position_query
+    collected_jobs: list[dict] = []
+    queries_used: list[str] = []
 
     with httpx.Client(timeout=60, follow_redirects=True) as client:
-        for request in search_requests:
-            params = {
-                "app_id": adzuna_app_id,
-                "app_key": adzuna_app_key,
-                "results_per_page": min(max(max_results * 4, max_results), 50),
-                "what": request["what"],
-                "sort_by": "date",
-                "content-type": "application/json",
-            }
-            if request.get("where"):
-                params["where"] = request["where"]
-
-            response = client.get(
-                url,
-                params=params,
-                headers={"Accept": "application/json"},
+        for position_query in position_queries:
+            search_requests = _build_adzuna_search_requests(
+                position_query=position_query,
+                location=location,
+                country_code=country_code,
             )
-            response.raise_for_status()
-            payload = response.json()
-
-            items = payload.get("results", []) if isinstance(payload, dict) else []
-            jobs = [
-                {
-                    "id": item.get("id") or item.get("adref"),
-                    "title": item.get("title"),
-                    "company": (item.get("company") or {}).get("display_name", ""),
-                    "location": (item.get("location") or {}).get("display_name", "") or location,
-                    "snippet": (item.get("description") or "")[:500],
-                    "url": item.get("redirect_url") or item.get("redirectUrl"),
-                    "matched_role": role,
+            for request in search_requests:
+                params = {
+                    "app_id": adzuna_app_id,
+                    "app_key": adzuna_app_key,
+                    "results_per_page": _provider_fetch_limit(max_results),
+                    "what": request["what"],
+                    "sort_by": "date",
+                    "content-type": "application/json",
                 }
-                for item in items
-            ]
-            if request.get("remote_only"):
-                jobs = [job for job in jobs if _looks_like_remote_job(job)]
+                if request.get("where"):
+                    params["where"] = request["where"]
 
-            last_jobs = jobs
-            last_query_used = request["what"]
-            if jobs:
-                break
+                response = client.get(
+                    url,
+                    params=params,
+                    headers={"Accept": "application/json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
 
-    filtered_jobs, fallback_jobs = _filter_jobs_for_experience(last_jobs, min_years, max_years)
+                items = payload.get("results", []) if isinstance(payload, dict) else []
+                jobs = [
+                    {
+                        "id": item.get("id") or item.get("adref"),
+                        "title": item.get("title"),
+                        "company": (item.get("company") or {}).get("display_name", ""),
+                        "location": (item.get("location") or {}).get("display_name", "") or location,
+                        "snippet": (item.get("description") or "")[:500],
+                        "url": item.get("redirect_url") or item.get("redirectUrl"),
+                        "matched_role": role,
+                    }
+                    for item in items
+                ]
+                if request.get("remote_only"):
+                    jobs = [job for job in jobs if _looks_like_remote_job(job)]
 
-    if max_years is not None and max_years <= 1:
-        selected_jobs = filtered_jobs[:max_results]
-    else:
-        selected_jobs = (filtered_jobs or fallback_jobs or last_jobs)[:max_results]
+                if jobs:
+                    collected_jobs = _merge_job_lists([collected_jobs, jobs], max_results=_provider_fetch_limit(max_results))
+                    queries_used.append(request["what"])
+
+                relevant_jobs = _rank_jobs_for_requested_role(collected_jobs, role)
+                selected_jobs = _select_jobs_for_requested_experience(
+                    relevant_jobs,
+                    min_years,
+                    max_years,
+                    max_results,
+                )
+                if len(selected_jobs) >= max_results:
+                    return {
+                        "jobs": selected_jobs,
+                        "query_used": " | ".join(queries_used) or request["what"],
+                        "provider": "adzuna",
+                        "country_used": country_code.upper(),
+                    }
+                if jobs:
+                    break
+
+    relevant_jobs = _rank_jobs_for_requested_role(collected_jobs, role)
+    selected_jobs = _select_jobs_for_requested_experience(
+        relevant_jobs,
+        min_years,
+        max_years,
+        max_results,
+    )
 
     return {
         "jobs": selected_jobs,
-        "query_used": last_query_used,
+        "query_used": " | ".join(queries_used) or (position_queries[0] if position_queries else role),
         "provider": "adzuna",
         "country_used": country_code.upper(),
     }
@@ -450,49 +700,74 @@ def _search_jobs_once_apify(
     max_years: Optional[float],
     apify_token: str,
 ) -> dict:
-    position_query = _build_position_query(role, min_years, max_years)
+    position_queries = _build_position_query_variants(role, min_years, max_years)
 
     url = "https://api.apify.com/v2/acts/misceres~indeed-scraper/run-sync-get-dataset-items"
+    actor_timeout_seconds = _resolve_apify_actor_timeout_seconds()
     params = {
         "token": apify_token,
         "memory": 1024,
-        "timeout": 120,
+        "timeout": actor_timeout_seconds,
     }
-    payload = {
-        "position": position_query,
-        "location": location,
-        "maxItems": min(max(max_results * 4, max_results), 20),
-    }
-    if resolved_country:
-        payload["country"] = resolved_country
 
-    with httpx.Client(timeout=60) as client:
-        response = client.post(url, params=params, json=payload)
-        response.raise_for_status()
-        items = response.json()
+    collected_jobs: list[dict] = []
+    queries_used: list[str] = []
+    with httpx.Client(timeout=_resolve_apify_http_timeout_seconds()) as client:
+        for position_query in position_queries:
+            payload = {
+                "position": position_query,
+                "location": location,
+                "maxItems": _provider_fetch_limit(max_results),
+            }
+            if resolved_country:
+                payload["country"] = resolved_country
 
-    jobs = [
-        {
-            "id": item.get("id"),
-            "title": item.get("positionName"),
-            "company": item.get("company"),
-            "location": item.get("location"),
-            "snippet": (item.get("description") or "")[:500],
-            "url": item.get("url"),
-            "matched_role": role,
-        }
-        for item in items
-    ]
-    filtered_jobs, fallback_jobs = _filter_jobs_for_experience(jobs, min_years, max_years)
+            response = client.post(url, params=params, json=payload)
+            response.raise_for_status()
+            items = response.json()
 
-    if max_years is not None and max_years <= 1:
-        selected_jobs = filtered_jobs[:max_results]
-    else:
-        selected_jobs = (filtered_jobs or fallback_jobs or jobs)[:max_results]
+            jobs = [
+                {
+                    "id": item.get("id"),
+                    "title": item.get("positionName"),
+                    "company": item.get("company"),
+                    "location": item.get("location"),
+                    "snippet": (item.get("description") or "")[:500],
+                    "url": item.get("url"),
+                    "matched_role": role,
+                }
+                for item in items
+            ]
+            if jobs:
+                collected_jobs = _merge_job_lists([collected_jobs, jobs], max_results=_provider_fetch_limit(max_results))
+                queries_used.append(position_query)
+
+            relevant_jobs = _rank_jobs_for_requested_role(collected_jobs, role)
+            selected_jobs = _select_jobs_for_requested_experience(
+                relevant_jobs,
+                min_years,
+                max_years,
+                max_results,
+            )
+            if len(selected_jobs) >= max_results:
+                return {
+                    "jobs": selected_jobs,
+                    "query_used": " | ".join(queries_used) or position_query,
+                    "provider": "apify",
+                    "country_used": resolved_country,
+                }
+
+    relevant_jobs = _rank_jobs_for_requested_role(collected_jobs, role)
+    selected_jobs = _select_jobs_for_requested_experience(
+        relevant_jobs,
+        min_years,
+        max_years,
+        max_results,
+    )
 
     return {
         "jobs": selected_jobs,
-        "query_used": position_query,
+        "query_used": " | ".join(queries_used) or (position_queries[0] if position_queries else role),
         "provider": "apify",
         "country_used": resolved_country,
     }
@@ -737,12 +1012,13 @@ def _search_jobs_once_browseract(
         )
 
     jobs = _extract_browseract_jobs(task_payload, role=role, location=location)
-    filtered_jobs, fallback_jobs = _filter_jobs_for_experience(jobs, min_years, max_years)
-
-    if max_years is not None and max_years <= 1:
-        selected_jobs = filtered_jobs[:max_results]
-    else:
-        selected_jobs = (filtered_jobs or fallback_jobs or jobs)[:max_results]
+    relevant_jobs = _rank_jobs_for_requested_role(jobs, role)
+    selected_jobs = _select_jobs_for_requested_experience(
+        relevant_jobs,
+        min_years,
+        max_years,
+        max_results,
+    )
 
     return {
         "jobs": selected_jobs,
@@ -763,8 +1039,9 @@ def _search_jobs_once(
     apify_token: Optional[str] = None,
     adzuna_app_id: Optional[str] = None,
     adzuna_app_key: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> dict:
-    provider = _resolve_job_search_provider()
+    provider = provider or _resolve_job_search_provider()
     if provider == "adzuna":
         if not adzuna_app_id or not adzuna_app_key:
             raise ValueError("ADZUNA_APP_ID and ADZUNA_APP_KEY are required for Adzuna job search.")
