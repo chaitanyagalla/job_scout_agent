@@ -4,9 +4,7 @@
 
 Job Scout should become:
 
-`A resume-grounded job copilot that finds jobs, explains why they matter, and helps the user improve their odds of getting interviews.`
-
-That is a stronger product identity than a generic "AI job search agent."
+`A resume-grounded job tool that finds jobs, explains why they matter, and helps the user improve their odds of getting interviews.`
 
 ## V1 Quick Wins
 

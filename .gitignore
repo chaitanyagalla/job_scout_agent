@@ -34,6 +34,19 @@ pip-wheel-metadata/
 
 # Local agent / runtime state
 .adk/
+backend.err
+backend.out
+backend.pid
+frontend.err
+frontend.out
+frontend.pid
+
+# Next.js frontend
+frontend/.env*.local
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+frontend/.vercel/
 
 # Editor / OS files
 .vscode/
