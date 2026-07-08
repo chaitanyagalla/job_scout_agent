@@ -234,7 +234,7 @@ root_agent = LlmAgent(
     name="job_scout",
     model=GEMINI_MODEL,
     description=(
-        "An AI job-search assistant that can search jobs from a user's prompt alone, "
+        "A job-search assistant that can search jobs from a user's prompt alone, "
         "or read an uploaded resume, build a structured profile, score jobs against it, "
         "and rank the best matches."
     ),
